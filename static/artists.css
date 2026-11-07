@@ -22,3 +22,14 @@ main{margin:0 0 0 174px;padding:20px clamp(16px,3vw,38px) 38px;max-width:none}
 #library.compact{grid-template-columns:1fr}#library.compact .artist-open{display:flex;align-items:center}#library.compact .cover{width:74px;flex:none}#library.compact .artist-new{min-height:48px}
 .profile-panels{margin-top:16px;align-items:start}.profile-stack{display:grid;gap:12px}.profile-image{margin-bottom:12px}.profile-panels dl{margin:0 0 14px}.profile-panels dl>div{display:grid;grid-template-columns:minmax(100px,2fr) minmax(0,3fr);gap:8px;border-bottom:1px solid var(--line);padding:8px 0}.profile-panels dt,.profile-panels dd{margin:0}.profile-panels a{color:var(--mint)}
 @media(max-width:850px){.sidebar{width:52px}.sidebar span,.sidebar small{display:none}main{margin-left:52px}.profile-panels{grid-template-columns:1fr}}
+
+
+/* Módulo Composición: tarjetas alineadas con el diseño de Arreglos. */
+.composition-grid{grid-template-columns:repeat(3,minmax(0,1fr));margin-top:18px}
+.composition-card{min-height:275px;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;background:linear-gradient(145deg,#0e3745,#0b2331 55%);border-color:var(--mint);text-align:center}
+.composition-card .symbol svg{width:57px;height:57px}
+.composition-card p{margin-bottom:24px}
+.composition-card button{margin-top:auto}
+.composition-detail .card{max-width:900px}
+@media(max-width:1050px){.composition-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.composition-grid{grid-template-columns:1fr}}
