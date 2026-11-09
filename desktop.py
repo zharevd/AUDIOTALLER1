@@ -32,6 +32,29 @@ def main():
             result = webview.windows[0].create_file_dialog(kind, allow_multiple=False)
             return result[0] if result else ''
 
+        def choose_audio_files(self):
+            # El usuario puede seleccionar varios archivos de audio en una sola operación.
+            result = webview.windows[0].create_file_dialog(
+                webview.FileDialog.OPEN, allow_multiple=True
+            )
+            return list(result) if result else []
+
+        def open_location(self, beat_id):
+            # El ID se resuelve contra la biblioteca local; nunca se acepta una ruta del navegador.
+            from app import db_open
+            with db_open() as db:
+                row = db.execute('SELECT ruta FROM beats WHERE id=?', (str(beat_id),)).fetchone()
+            if not row:
+                return False
+            try:
+                archivo = Path(row['ruta']).resolve(strict=True)
+                if not archivo.is_file():
+                    return False
+                os.startfile(str(archivo.parent))
+                return True
+            except (OSError, RuntimeError):
+                return False
+
     webview.create_window("AudioTaller", app, width=1280, height=800, js_api=Dialogs())
     webview.start(gui="edgechromium", debug=False)
 

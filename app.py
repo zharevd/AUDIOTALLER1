@@ -28,7 +28,14 @@ def db_open():
     CREATE TABLE IF NOT EXISTS detalle_disco(id TEXT PRIMARY KEY, datos TEXT NOT NULL, creado TEXT, actualizado TEXT DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS detalle_cancion(id TEXT PRIMARY KEY, datos TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS versiones(id TEXT PRIMARY KEY,sesion_id TEXT NOT NULL,ruta TEXT NOT NULL,comentario TEXT DEFAULT '',creado TEXT DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS beats(id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL UNIQUE,creado TEXT DEFAULT CURRENT_TIMESTAMP);
     ''')
+    # Agrega el orden manual sin perder la lista de beats creada en versiones anteriores.
+    beat_columns = {row['name'] for row in db.execute('PRAGMA table_info(beats)')}
+    if 'posicion' not in beat_columns:
+        db.execute('ALTER TABLE beats ADD COLUMN posicion INTEGER NOT NULL DEFAULT 0')
+        legacy_ids = [row['id'] for row in db.execute('SELECT id FROM beats ORDER BY creado DESC,nombre COLLATE NOCASE')]
+        db.executemany('UPDATE beats SET posicion=? WHERE id=?', [(i, bid) for i, bid in enumerate(legacy_ids)])
     try:
         migrate(db, DB)
         with db:
@@ -285,6 +292,88 @@ def arrangements_takes(sid):
                                   token=take_tokens.dumps(str(path))))
     takes.sort(key=lambda take: (take['origen'].casefold(), take['carpeta'].casefold(), take['nombre'].casefold()))
     return jsonify(tomas=takes, carpetas_inaccesibles=len(missing))
+
+
+@app.get('/api/beats')
+def beats_list():
+    with db_open() as db:
+        rows = db.execute('SELECT id,nombre,ruta,creado FROM beats ORDER BY posicion,id').fetchall()
+    audios = []
+    for row in rows:
+        path = Path(row['ruta'])
+        available = path.is_file()
+        audios.append(dict(id=row['id'], nombre=row['nombre'], formato=path.suffix[1:].upper(),
+                           disponible=available, creado=row['creado']))
+    return jsonify(audios=audios)
+
+
+@app.post('/api/beats')
+def beats_add():
+    data = request.get_json() or {}
+    paths = data.get('paths', [])
+    if not isinstance(paths, list) or not paths or len(paths) > 200:
+        return jsonify(error='Seleccioná entre 1 y 200 archivos de audio.'), 400
+    added = skipped = 0
+    with db_open() as db:
+        for raw in paths:
+            if not isinstance(raw, str) or len(raw) > 32767:
+                skipped += 1
+                continue
+            try:
+                path = Path(raw).resolve(strict=True)
+                if not path.is_file() or path.suffix.lower() not in AUDIO_TYPES:
+                    skipped += 1
+                    continue
+                next_position = db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM beats').fetchone()[0]
+                cursor = db.execute('INSERT OR IGNORE INTO beats(id,nombre,ruta,posicion) VALUES(?,?,?,?)',
+                                    (uuid.uuid4().hex, path.name, str(path), next_position))
+                added += cursor.rowcount
+                if not cursor.rowcount:
+                    skipped += 1
+            except (OSError, RuntimeError, ValueError):
+                skipped += 1
+    return jsonify(agregados=added, omitidos=skipped), 201
+
+
+@app.put('/api/beats/orden')
+def beats_reorder():
+    data = request.get_json() or {}
+    ids = data.get('ids')
+    if not isinstance(ids, list) or len(ids) > 10000 or any(not isinstance(item, str) for item in ids):
+        return jsonify(error='La lista de posiciones no es válida.'), 400
+    if len(ids) != len(set(ids)):
+        return jsonify(error='La lista contiene audios repetidos.'), 400
+    with db_open() as db:
+        current_ids = {row['id'] for row in db.execute('SELECT id FROM beats')}
+        if set(ids) != current_ids:
+            return jsonify(error='La lista cambió. Actualizá Beats e intentá nuevamente.'), 409
+        db.executemany('UPDATE beats SET posicion=? WHERE id=?', [(i, bid) for i, bid in enumerate(ids)])
+    return jsonify(ok=True)
+
+
+@app.delete('/api/beats/<bid>')
+def beats_remove(bid):
+    with db_open() as db:
+        cursor = db.execute('DELETE FROM beats WHERE id=?', (bid,))
+    if not cursor.rowcount:
+        return jsonify(error='El audio no está en la lista.'), 404
+    return jsonify(ok=True)
+
+
+@app.get('/api/beats/<bid>/audio')
+def beats_audio(bid):
+    with db_open() as db:
+        row = db.execute('SELECT ruta FROM beats WHERE id=?', (bid,)).fetchone()
+    if not row:
+        return jsonify(error='El audio ya no está en la lista.'), 404
+    try:
+        path = Path(row['ruta']).resolve(strict=True)
+        mimetype = AUDIO_TYPES.get(path.suffix.lower())
+        if mimetype and path.is_file():
+            return send_file(path, mimetype=mimetype, conditional=True, max_age=0)
+    except (OSError, RuntimeError):
+        pass
+    return jsonify(error='El archivo ya no está disponible en su ubicación original.'), 404
 
 
 @app.get('/api/arreglos/audio/<token>')
