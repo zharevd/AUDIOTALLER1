@@ -38,6 +38,16 @@ def db_open():
         playlist_id TEXT NOT NULL DEFAULT 'default' REFERENCES playlists(id),
         UNIQUE(playlist_id,ruta)
     );
+    CREATE TABLE IF NOT EXISTS score_collections(
+        id TEXT PRIMARY KEY,nombre TEXT NOT NULL,posicion INTEGER NOT NULL DEFAULT 0,
+        creado TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS scores(
+        id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL,
+        creado TEXT DEFAULT CURRENT_TIMESTAMP,posicion INTEGER NOT NULL DEFAULT 0,
+        collection_id TEXT NOT NULL REFERENCES score_collections(id),
+        UNIQUE(collection_id,ruta)
+    );
     ''')
     # Migración compatible: la lista de Beats existente pasa a ser "Mi lista".
     db.execute("INSERT OR IGNORE INTO playlists(id,nombre,posicion) VALUES('default','Mi lista',0)")
@@ -460,6 +470,111 @@ def beats_audio(bid):
     except (OSError, RuntimeError):
         pass
     return jsonify(error='El archivo ya no está disponible en su ubicación original.'), 404
+
+
+# Partituras: colecciones y referencias a archivos originales (no se copian ni borran).
+SCORE_TYPES = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
+
+@app.get('/api/scores/collections')
+def scores_collections():
+    with db_open() as db:
+        rows = db.execute('''SELECT c.id,c.nombre,c.posicion,c.creado,COUNT(s.id) AS cantidad
+            FROM score_collections c LEFT JOIN scores s ON s.collection_id=c.id
+            GROUP BY c.id ORDER BY c.posicion,c.creado,c.nombre COLLATE NOCASE''').fetchall()
+    return jsonify(colecciones=[dict(row) for row in rows])
+
+@app.post('/api/scores/collections')
+def scores_collection_create():
+    data = request.get_json() or {}
+    name = data.get('nombre', '').strip() if isinstance(data.get('nombre', ''), str) else ''
+    if not name or len(name) > 80:
+        return jsonify(error='Ingresá un nombre de colección de entre 1 y 80 caracteres.'), 400
+    cid = uuid.uuid4().hex
+    with db_open() as db:
+        pos = db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM score_collections').fetchone()[0]
+        db.execute('INSERT INTO score_collections(id,nombre,posicion) VALUES(?,?,?)', (cid,name,pos))
+    return jsonify(id=cid,nombre=name), 201
+
+@app.patch('/api/scores/collections/<cid>')
+def scores_collection_rename(cid):
+    data = request.get_json() or {}
+    name = data.get('nombre', '').strip() if isinstance(data.get('nombre', ''), str) else ''
+    if not name or len(name) > 80:
+        return jsonify(error='Ingresá un nombre de colección de entre 1 y 80 caracteres.'), 400
+    with db_open() as db:
+        cur = db.execute('UPDATE score_collections SET nombre=? WHERE id=?', (name,cid))
+    if not cur.rowcount: return jsonify(error='No se encontró la colección.'), 404
+    return jsonify(ok=True,nombre=name)
+
+@app.delete('/api/scores/collections/<cid>')
+def scores_collection_delete(cid):
+    with db_open() as db:
+        collection = db.execute('SELECT id,nombre FROM score_collections WHERE id=?', (cid,)).fetchone()
+        if not collection: return jsonify(error='No se encontró la colección.'), 404
+        count = db.execute('SELECT COUNT(*) FROM scores WHERE collection_id=?', (cid,)).fetchone()[0]
+        db.execute('DELETE FROM scores WHERE collection_id=?', (cid,))
+        db.execute('DELETE FROM score_collections WHERE id=?', (cid,))
+    return jsonify(ok=True,eliminados=count,nombre=collection['nombre'])
+
+@app.get('/api/scores')
+def scores_list():
+    cid = request.args.get('collection_id', '')
+    with db_open() as db:
+        if not db.execute('SELECT 1 FROM score_collections WHERE id=?', (cid,)).fetchone():
+            return jsonify(error='No se encontró la colección seleccionada.'), 404
+        rows = db.execute('SELECT id,nombre,ruta,creado FROM scores WHERE collection_id=? ORDER BY posicion,id', (cid,)).fetchall()
+    result=[]
+    for row in rows:
+        path=Path(row['ruta'])
+        result.append(dict(id=row['id'],nombre=row['nombre'],formato=path.suffix[1:].upper(),disponible=path.is_file(),creado=row['creado']))
+    return jsonify(partituras=result,collection_id=cid)
+
+@app.post('/api/scores')
+def scores_add():
+    data=request.get_json() or {}; paths=data.get('paths',[]); cid=data.get('collection_id','')
+    if not isinstance(paths,list) or not paths or len(paths)>200:
+        return jsonify(error='Seleccioná entre 1 y 200 archivos de partituras.'),400
+    added=skipped=0
+    with db_open() as db:
+        if not db.execute('SELECT 1 FROM score_collections WHERE id=?',(cid,)).fetchone():
+            return jsonify(error='No se encontró la colección seleccionada.'),404
+        for raw in paths:
+            if not isinstance(raw,str) or len(raw)>32767: skipped+=1; continue
+            try:
+                path=Path(raw).resolve(strict=True)
+                if not path.is_file() or path.suffix.lower() not in SCORE_TYPES: skipped+=1; continue
+                pos=db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM scores WHERE collection_id=?',(cid,)).fetchone()[0]
+                cur=db.execute('INSERT OR IGNORE INTO scores(id,nombre,ruta,posicion,collection_id) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,path.name,str(path),pos,cid))
+                added+=cur.rowcount; skipped+=int(not cur.rowcount)
+            except (OSError,RuntimeError,ValueError): skipped+=1
+    return jsonify(agregados=added,omitidos=skipped),201
+
+@app.put('/api/scores/orden')
+def scores_reorder():
+    data=request.get_json() or {}; ids=data.get('ids'); cid=data.get('collection_id','')
+    if not isinstance(ids,list) or len(ids)>10000 or any(not isinstance(x,str) for x in ids) or len(ids)!=len(set(ids)):
+        return jsonify(error='La lista de posiciones no es válida.'),400
+    with db_open() as db:
+        current={r['id'] for r in db.execute('SELECT id FROM scores WHERE collection_id=?',(cid,))}
+        if set(ids)!=current: return jsonify(error='La lista cambió. Actualizá Partituras e intentá nuevamente.'),409
+        db.executemany('UPDATE scores SET posicion=? WHERE id=? AND collection_id=?',[(i,sid,cid) for i,sid in enumerate(ids)])
+    return jsonify(ok=True)
+
+@app.delete('/api/scores/<sid>')
+def scores_remove(sid):
+    with db_open() as db: cur=db.execute('DELETE FROM scores WHERE id=?',(sid,))
+    if not cur.rowcount: return jsonify(error='La partitura no está en la colección.'),404
+    return jsonify(ok=True)
+
+@app.get('/api/scores/<sid>/file')
+def scores_file(sid):
+    with db_open() as db: row=db.execute('SELECT ruta FROM scores WHERE id=?',(sid,)).fetchone()
+    if not row: return jsonify(error='La partitura ya no está en la colección.'),404
+    try:
+        path=Path(row['ruta']).resolve(strict=True); mime=SCORE_TYPES.get(path.suffix.lower())
+        if mime and path.is_file(): return send_file(path,mimetype=mime,conditional=True,max_age=0)
+    except (OSError,RuntimeError): pass
+    return jsonify(error='El archivo ya no está disponible en su ubicación original.'),404
 
 
 @app.get('/api/arreglos/audio/<token>')

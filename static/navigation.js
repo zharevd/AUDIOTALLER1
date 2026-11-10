@@ -28,6 +28,7 @@ function display() {
     window.scrollTo(0, 0);
     if (page === 'profile' && artist) renderProfile();
     if (page === 'beats') loadBeats();
+    if (page === 'scores') loadScores();
     if (visible === 'manager') {
         const projects = page === 'projectManager';
         $('managerTitle').textContent = projects ? 'Gestión de proyectos por artistas' : 'Gestión de artistas';
@@ -632,3 +633,154 @@ $('beatsPlaylistSelect').addEventListener('change', async event => {
 });
 $('addBeats').addEventListener('click', addBeats);
 $('openBeatFolder').addEventListener('click', () => openBeatFolder());
+
+
+// Partituras: colecciones independientes, archivos originales y visor integrado.
+let selectedScoreCollectionId = localStorage.getItem('audiotaller.scores.collection') || null;
+let selectedScoreId = null;
+let scoreCollections = [];
+let scoreDialogMode = 'create';
+let draggedScoreId = null;
+let scoresRequest = 0;
+
+async function loadScores(loadCollections = true) {
+    const requestId = ++scoresRequest;
+    try {
+        if (loadCollections) {
+            const data = await api('/api/scores/collections');
+            scoreCollections = data.colecciones || [];
+            if (!scoreCollections.some(x => x.id === selectedScoreCollectionId)) {
+                const saved = localStorage.getItem('audiotaller.scores.collection');
+                selectedScoreCollectionId = scoreCollections.some(x => x.id === saved) ? saved : (scoreCollections[0]?.id || null);
+            }
+            $('scoresCollectionSelect').innerHTML = scoreCollections.map(x => `<option value="${esc(x.id)}">${esc(x.nombre)}</option>`).join('');
+            $('scoresCollectionSelect').value = selectedScoreCollectionId || '';
+            $('scoresCollectionSelect').disabled = !scoreCollections.length;
+            $('renameScoreCollection').disabled = !selectedScoreCollectionId;
+            $('deleteScoreCollection').disabled = !selectedScoreCollectionId;
+            $('addScores').disabled = !selectedScoreCollectionId;
+            if (selectedScoreCollectionId) localStorage.setItem('audiotaller.scores.collection', selectedScoreCollectionId);
+            else localStorage.removeItem('audiotaller.scores.collection');
+        }
+        if (!selectedScoreCollectionId) {
+            $('scoresCount').textContent = '0 partituras'; $('scoresListTitle').textContent = 'Sin colecciones';
+            $('scoresStatus').textContent = 'Todavía no hay colecciones. Creá una para comenzar.';
+            $('scoresList').innerHTML = '<div class="muted">No hay colecciones de partituras.</div>';
+            clearScoreViewer(); return;
+        }
+        const data = await api('/api/scores?collection_id=' + encodeURIComponent(selectedScoreCollectionId));
+        if (requestId !== scoresRequest || trail.at(-1) !== 'scores') return;
+        renderScores(data);
+    } catch (error) { if (requestId === scoresRequest) $('scoresStatus').textContent = error.message; }
+}
+function clearScoreViewer() {
+    selectedScoreId = null; $('scoreNow').textContent = 'Seleccioná una partitura de la colección para verla.';
+    $('openScoreFolder').disabled = true;
+    $('scoreViewer').innerHTML = '<div class="score-viewer-empty">♫<br>La vista previa aparecerá acá.</div>';
+}
+function renderScores(data) {
+    const items = data.partituras || [];
+    const collection = scoreCollections.find(x => x.id === selectedScoreCollectionId);
+    $('scoresCount').textContent = items.length + (items.length === 1 ? ' partitura' : ' partituras');
+    $('scoresListTitle').textContent = collection?.nombre || 'Mis partituras';
+    $('scoresStatus').textContent = items.length ? `Colección «${collection?.nombre || 'Partituras'}» guardada automáticamente.` : 'Esta colección está vacía. Usá «Agregar partituras» para elegir archivos de tu PC.';
+    if (selectedScoreId && !items.some(x => x.id === selectedScoreId)) clearScoreViewer();
+    $('scoresList').innerHTML = items.length ? items.map(item => `
+      <div class="item score-row" draggable="true" data-score-row="${esc(item.id)}">
+        <span class="score-grip" title="Arrastrar para cambiar el orden">⠿</span>
+        <button class="score-select" data-score-select="${esc(item.id)}" aria-pressed="${item.id === selectedScoreId}"><span>▤ <b>${esc(item.nombre)}</b><small class="muted">${esc(item.formato)} · ${item.disponible ? 'Disponible' : '<span class="score-missing">No se encuentra en esta ubicación</span>'}</small></span></button>
+        <div class="score-actions"><button class="alt" data-score-folder="${esc(item.id)}" title="Abrir carpeta" ${item.disponible ? '' : 'disabled'}>📁</button><button class="alt" data-score-remove="${esc(item.id)}" title="Quitar de la colección">✕</button></div>
+      </div>`).join('') : '<div class="muted">Tu colección está vacía.</div>';
+    for (const b of $('scoresList').querySelectorAll('[data-score-select]')) b.addEventListener('click', () => selectScore(b.dataset.scoreSelect, items));
+    for (const b of $('scoresList').querySelectorAll('[data-score-folder]')) b.addEventListener('click', () => openScoreFolder(b.dataset.scoreFolder));
+    for (const b of $('scoresList').querySelectorAll('[data-score-remove]')) b.addEventListener('click', () => removeScore(b.dataset.scoreRemove));
+    bindScoreReordering();
+    if (selectedScoreId) { const selected = items.find(x => x.id === selectedScoreId); if (selected) $('scoreNow').textContent = selected.nombre; }
+}
+function selectScore(id, items) {
+    const item = items.find(x => x.id === id);
+    if (!item || !item.disponible) { report(Error('No se encuentra el archivo en su ubicación original.')); return; }
+    selectedScoreId = id; $('scoreNow').textContent = item.nombre; $('openScoreFolder').disabled = false;
+    const url = '/api/scores/' + encodeURIComponent(id) + '/file';
+    if (item.formato === 'PDF') $('scoreViewer').innerHTML = `<iframe title="Vista previa de ${esc(item.nombre)}" src="${url}"></iframe>`;
+    else $('scoreViewer').innerHTML = `<img alt="Vista previa de ${esc(item.nombre)}" src="${url}">`;
+    renderScores({partituras:items});
+}
+async function addScores() {
+    try {
+        if (!selectedScoreCollectionId) throw Error('Primero creá o seleccioná una colección.');
+        if (!window.pywebview?.api?.choose_score_files) throw Error('El selector local está disponible al iniciar AudioTaller desde Iniciar_AudioTaller.vbs.');
+        const paths = await window.pywebview.api.choose_score_files(); if (!paths?.length) return;
+        const result = await api('/api/scores', body({paths,collection_id:selectedScoreCollectionId}));
+        $('scoresStatus').textContent = result.agregados + ' partitura(s) agregada(s).' + (result.omitidos ? ' ' + result.omitidos + ' omitida(s).' : '');
+        await loadScores(true);
+    } catch (error) { report(error); }
+}
+async function openScoreFolder(id=selectedScoreId) {
+    if (!id) return;
+    try {
+        if (!window.pywebview?.api?.open_score_location) throw Error('La apertura de carpetas requiere la aplicación de escritorio.');
+        if (!await window.pywebview.api.open_score_location(id)) throw Error('No se pudo abrir la carpeta de la partitura.');
+    } catch (error) { report(error); }
+}
+async function removeScore(id) {
+    if (!confirm('¿Quitar esta partitura de la colección? El archivo original no se borrará.')) return;
+    try { await api('/api/scores/' + encodeURIComponent(id), {method:'DELETE'}); await loadScores(true); }
+    catch (error) { report(error); }
+}
+async function deleteScoreCollection() {
+    const collection = scoreCollections.find(x => x.id === selectedScoreCollectionId); if (!collection) return;
+    const count = Number(collection.cantidad) || 0;
+    if (!confirm(`¿Eliminar la colección «${collection.nombre}»? Se quitarán ${count} referencia(s) de AudioTaller, pero los archivos originales permanecerán en tu PC.`)) return;
+    try {
+        await api('/api/scores/collections/' + encodeURIComponent(collection.id), {method:'DELETE'});
+        selectedScoreCollectionId = null; localStorage.removeItem('audiotaller.scores.collection'); clearScoreViewer(); await loadScores(true);
+    } catch (error) { report(error); }
+}
+function openScoreCollectionDialog(mode) {
+    scoreDialogMode = mode; const current = scoreCollections.find(x => x.id === selectedScoreCollectionId);
+    $('scoreCollectionDialogTitle').textContent = mode === 'create' ? 'Crear nueva colección' : 'Cambiar nombre de la colección';
+    $('scoreCollectionName').value = mode === 'rename' ? (current?.nombre || '') : '';
+    $('scoreCollectionDialog').showModal(); $('scoreCollectionName').focus();
+}
+$('scoreCollectionForm').addEventListener('submit', async event => {
+    event.preventDefault(); const name = $('scoreCollectionName').value.trim(); if (!name) return;
+    const submit = $('scoreCollectionForm').querySelector('[type=submit]'); submit.disabled = true;
+    try {
+        if (scoreDialogMode === 'create') {
+            const created = await api('/api/scores/collections', body({nombre:name}));
+            selectedScoreCollectionId = created.id; localStorage.setItem('audiotaller.scores.collection',created.id);
+        } else await api('/api/scores/collections/' + encodeURIComponent(selectedScoreCollectionId), {method:'PATCH',body:JSON.stringify({nombre:name})});
+        $('scoreCollectionDialog').close(); await loadScores(true);
+    } catch (error) { report(error); } finally { submit.disabled = false; }
+});
+function bindScoreReordering() {
+    const rows = $('scoresList').querySelectorAll('[data-score-row]');
+    rows.forEach(row => {
+        row.addEventListener('dragstart', event => { draggedScoreId=row.dataset.scoreRow; row.classList.add('beat-dragging'); event.dataTransfer.effectAllowed='move'; event.dataTransfer.setData('text/plain',draggedScoreId); });
+        row.addEventListener('dragover', event => { if (!draggedScoreId || draggedScoreId===row.dataset.scoreRow) return; event.preventDefault(); event.dataTransfer.dropEffect='move'; row.classList.add('beat-drop-target'); });
+        row.addEventListener('dragleave', () => row.classList.remove('beat-drop-target'));
+        row.addEventListener('drop', async event => { event.preventDefault(); row.classList.remove('beat-drop-target'); const source=draggedScoreId || event.dataTransfer.getData('text/plain'); draggedScoreId=null; if(source && source!==row.dataset.scoreRow) await moveScoreBefore(source,row.dataset.scoreRow); });
+        row.addEventListener('dragend', () => { draggedScoreId=null; rows.forEach(x=>x.classList.remove('beat-dragging','beat-drop-target')); });
+    });
+}
+async function moveScoreBefore(sourceId,targetId) {
+    try {
+        const data=await api('/api/scores?collection_id='+encodeURIComponent(selectedScoreCollectionId));
+        const ids=(data.partituras||[]).map(x=>x.id); const from=ids.indexOf(sourceId),to=ids.indexOf(targetId);
+        if(from<0||to<0||from===to)return; ids.splice(to,0,ids.splice(from,1)[0]);
+        await api('/api/scores/orden',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,collection_id:selectedScoreCollectionId})});
+        await loadScores(false);
+    } catch(error) { report(error); await loadScores(false); }
+}
+$('scoresCollectionSelect').addEventListener('change', async event => {
+    selectedScoreCollectionId=event.target.value||null;
+    if(selectedScoreCollectionId)localStorage.setItem('audiotaller.scores.collection',selectedScoreCollectionId);else localStorage.removeItem('audiotaller.scores.collection');
+    clearScoreViewer(); await loadScores(false);
+});
+$('addScores').addEventListener('click',addScores);
+$('newScoreCollection').addEventListener('click',()=>openScoreCollectionDialog('create'));
+$('renameScoreCollection').addEventListener('click',()=>openScoreCollectionDialog('rename'));
+$('deleteScoreCollection').addEventListener('click',deleteScoreCollection);
+$('openScoreFolder').addEventListener('click',()=>openScoreFolder());
+$('cancelScoreCollection').addEventListener('click',()=>$('scoreCollectionDialog').close());

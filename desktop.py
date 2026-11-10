@@ -39,6 +39,32 @@ def main():
             )
             return list(result) if result else []
 
+        def choose_score_files(self):
+            # PDF e imágenes de partituras; se conservan en su ubicación original.
+            result = webview.windows[0].create_file_dialog(
+                webview.FileDialog.OPEN, allow_multiple=True,
+                file_types=(
+                    'Partituras (*.pdf;*.png;*.jpg;*.jpeg)',
+                    'Todos los archivos (*.*)',
+                )
+            )
+            return list(result) if result else []
+
+        def open_score_location(self, score_id):
+            from app import db_open
+            with db_open() as db:
+                row = db.execute('SELECT ruta FROM scores WHERE id=?', (str(score_id),)).fetchone()
+            if not row:
+                return False
+            try:
+                archivo = Path(row['ruta']).resolve(strict=True)
+                if not archivo.is_file():
+                    return False
+                os.startfile(str(archivo.parent))
+                return True
+            except (OSError, RuntimeError):
+                return False
+
         def open_location(self, beat_id):
             # El ID se resuelve contra la biblioteca local; nunca se acepta una ruta del navegador.
             from app import db_open
