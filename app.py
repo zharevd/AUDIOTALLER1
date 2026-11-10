@@ -28,14 +28,41 @@ def db_open():
     CREATE TABLE IF NOT EXISTS detalle_disco(id TEXT PRIMARY KEY, datos TEXT NOT NULL, creado TEXT, actualizado TEXT DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS detalle_cancion(id TEXT PRIMARY KEY, datos TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS versiones(id TEXT PRIMARY KEY,sesion_id TEXT NOT NULL,ruta TEXT NOT NULL,comentario TEXT DEFAULT '',creado TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS beats(id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL UNIQUE,creado TEXT DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS playlists(
+        id TEXT PRIMARY KEY,nombre TEXT NOT NULL,posicion INTEGER NOT NULL DEFAULT 0,
+        creado TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS beats(
+        id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL,
+        creado TEXT DEFAULT CURRENT_TIMESTAMP,posicion INTEGER NOT NULL DEFAULT 0,
+        playlist_id TEXT NOT NULL DEFAULT 'default' REFERENCES playlists(id),
+        UNIQUE(playlist_id,ruta)
+    );
     ''')
-    # Agrega el orden manual sin perder la lista de beats creada en versiones anteriores.
+    # Migración compatible: la lista de Beats existente pasa a ser "Mi lista".
+    db.execute("INSERT OR IGNORE INTO playlists(id,nombre,posicion) VALUES('default','Mi lista',0)")
     beat_columns = {row['name'] for row in db.execute('PRAGMA table_info(beats)')}
     if 'posicion' not in beat_columns:
         db.execute('ALTER TABLE beats ADD COLUMN posicion INTEGER NOT NULL DEFAULT 0')
-        legacy_ids = [row['id'] for row in db.execute('SELECT id FROM beats ORDER BY creado DESC,nombre COLLATE NOCASE')]
-        db.executemany('UPDATE beats SET posicion=? WHERE id=?', [(i, bid) for i, bid in enumerate(legacy_ids)])
+        beat_columns.add('posicion')
+    if 'playlist_id' not in beat_columns:
+        db.execute("ALTER TABLE beats ADD COLUMN playlist_id TEXT")
+    db.execute("UPDATE beats SET playlist_id='default' WHERE playlist_id IS NULL OR playlist_id='' ")
+    # Las versiones anteriores imponían UNIQUE(ruta) global. Reconstruimos la tabla
+    # para permitir que un mismo archivo participe en distintas listas.
+    table_sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='beats'").fetchone()[0] or ''
+    if 'ruta TEXT NOT NULL UNIQUE' in table_sql.replace('\n', ' '):
+        db.execute('''CREATE TABLE beats_new(
+            id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL,
+            creado TEXT DEFAULT CURRENT_TIMESTAMP,posicion INTEGER NOT NULL DEFAULT 0,
+            playlist_id TEXT NOT NULL REFERENCES playlists(id),UNIQUE(playlist_id,ruta)
+        )''')
+        db.execute('''INSERT INTO beats_new(id,nombre,ruta,creado,posicion,playlist_id)
+                      SELECT id,nombre,ruta,creado,posicion,COALESCE(playlist_id,'default') FROM beats''')
+        db.execute('DROP TABLE beats')
+        db.execute('ALTER TABLE beats_new RENAME TO beats')
+    # Conserva el orden previo dentro de la lista inicial.
+    db.execute("UPDATE playlists SET nombre='Mi lista' WHERE id='default' AND nombre IS NULL")
     try:
         migrate(db, DB)
         with db:
@@ -294,27 +321,83 @@ def arrangements_takes(sid):
     return jsonify(tomas=takes, carpetas_inaccesibles=len(missing))
 
 
+@app.get('/api/beats/playlists')
+def beats_playlists():
+    with db_open() as db:
+        rows = db.execute('SELECT p.id,p.nombre,p.posicion,p.creado,COUNT(b.id) AS cantidad '
+                          'FROM playlists p LEFT JOIN beats b ON b.playlist_id=p.id '
+                          'GROUP BY p.id ORDER BY p.posicion,p.creado,p.nombre COLLATE NOCASE').fetchall()
+    return jsonify(listas=[dict(row) for row in rows])
+
+
+@app.post('/api/beats/playlists')
+def beats_playlist_create():
+    data = request.get_json() or {}
+    name = data.get('nombre', '').strip() if isinstance(data.get('nombre', ''), str) else ''
+    if not name or len(name) > 80:
+        return jsonify(error='Ingresá un nombre de lista de entre 1 y 80 caracteres.'), 400
+    playlist_id = uuid.uuid4().hex
+    with db_open() as db:
+        next_position = db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM playlists').fetchone()[0]
+        db.execute('INSERT INTO playlists(id,nombre,posicion) VALUES(?,?,?)', (playlist_id,name,next_position))
+    return jsonify(id=playlist_id,nombre=name), 201
+
+
+@app.patch('/api/beats/playlists/<pid>')
+def beats_playlist_rename(pid):
+    data = request.get_json() or {}
+    name = data.get('nombre', '').strip() if isinstance(data.get('nombre', ''), str) else ''
+    if not name or len(name) > 80:
+        return jsonify(error='Ingresá un nombre de lista de entre 1 y 80 caracteres.'), 400
+    with db_open() as db:
+        cursor = db.execute('UPDATE playlists SET nombre=? WHERE id=?', (name,pid))
+    if not cursor.rowcount:
+        return jsonify(error='No se encontró la lista seleccionada.'), 404
+    return jsonify(ok=True,nombre=name)
+
+
+@app.delete('/api/beats/playlists/<pid>')
+def beats_playlist_delete(pid):
+    # Elimina únicamente los registros de la lista; nunca toca los archivos originales.
+    with db_open() as db:
+        playlist = db.execute('SELECT id,nombre FROM playlists WHERE id=?', (pid,)).fetchone()
+        if not playlist:
+            return jsonify(error='No se encontró la lista seleccionada.'), 404
+        count = db.execute('SELECT COUNT(*) FROM beats WHERE playlist_id=?', (pid,)).fetchone()[0]
+        db.execute('DELETE FROM beats WHERE playlist_id=?', (pid,))
+        db.execute('DELETE FROM playlists WHERE id=?', (pid,))
+    return jsonify(ok=True, eliminados=count, nombre=playlist['nombre'])
+
+
 @app.get('/api/beats')
 def beats_list():
+    playlist_id = request.args.get('playlist_id', 'default')
     with db_open() as db:
-        rows = db.execute('SELECT id,nombre,ruta,creado FROM beats ORDER BY posicion,id').fetchall()
+        exists = db.execute('SELECT 1 FROM playlists WHERE id=?', (playlist_id,)).fetchone()
+        if not exists:
+            return jsonify(error='No se encontró la lista seleccionada.'), 404
+        rows = db.execute('''SELECT id,nombre,ruta,creado FROM beats
+                             WHERE playlist_id=? ORDER BY posicion,id''', (playlist_id,)).fetchall()
     audios = []
     for row in rows:
         path = Path(row['ruta'])
         available = path.is_file()
         audios.append(dict(id=row['id'], nombre=row['nombre'], formato=path.suffix[1:].upper(),
                            disponible=available, creado=row['creado']))
-    return jsonify(audios=audios)
+    return jsonify(audios=audios,playlist_id=playlist_id)
 
 
 @app.post('/api/beats')
 def beats_add():
     data = request.get_json() or {}
     paths = data.get('paths', [])
+    playlist_id = data.get('playlist_id', 'default')
     if not isinstance(paths, list) or not paths or len(paths) > 200:
         return jsonify(error='Seleccioná entre 1 y 200 archivos de audio.'), 400
     added = skipped = 0
     with db_open() as db:
+        if not db.execute('SELECT 1 FROM playlists WHERE id=?', (playlist_id,)).fetchone():
+            return jsonify(error='No se encontró la lista seleccionada.'), 404
         for raw in paths:
             if not isinstance(raw, str) or len(raw) > 32767:
                 skipped += 1
@@ -324,9 +407,10 @@ def beats_add():
                 if not path.is_file() or path.suffix.lower() not in AUDIO_TYPES:
                     skipped += 1
                     continue
-                next_position = db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM beats').fetchone()[0]
-                cursor = db.execute('INSERT OR IGNORE INTO beats(id,nombre,ruta,posicion) VALUES(?,?,?,?)',
-                                    (uuid.uuid4().hex, path.name, str(path), next_position))
+                next_position = db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM beats WHERE playlist_id=?', (playlist_id,)).fetchone()[0]
+                cursor = db.execute('''INSERT OR IGNORE INTO beats(id,nombre,ruta,posicion,playlist_id)
+                                       VALUES(?,?,?,?,?)''',
+                                    (uuid.uuid4().hex, path.name, str(path), next_position, playlist_id))
                 added += cursor.rowcount
                 if not cursor.rowcount:
                     skipped += 1
@@ -339,15 +423,17 @@ def beats_add():
 def beats_reorder():
     data = request.get_json() or {}
     ids = data.get('ids')
+    playlist_id = data.get('playlist_id', 'default')
     if not isinstance(ids, list) or len(ids) > 10000 or any(not isinstance(item, str) for item in ids):
         return jsonify(error='La lista de posiciones no es válida.'), 400
     if len(ids) != len(set(ids)):
         return jsonify(error='La lista contiene audios repetidos.'), 400
     with db_open() as db:
-        current_ids = {row['id'] for row in db.execute('SELECT id FROM beats')}
+        current_ids = {row['id'] for row in db.execute('SELECT id FROM beats WHERE playlist_id=?', (playlist_id,))}
         if set(ids) != current_ids:
             return jsonify(error='La lista cambió. Actualizá Beats e intentá nuevamente.'), 409
-        db.executemany('UPDATE beats SET posicion=? WHERE id=?', [(i, bid) for i, bid in enumerate(ids)])
+        db.executemany('UPDATE beats SET posicion=? WHERE id=? AND playlist_id=?',
+                       [(i, bid, playlist_id) for i, bid in enumerate(ids)])
     return jsonify(ok=True)
 
 

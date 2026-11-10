@@ -439,44 +439,70 @@ function renderProfile() {
 }
 
 
-// Beats: la lista se guarda en SQLite y solo conserva rutas a los archivos originales.
+// Beats: múltiples listas independientes, con rutas originales y orden propio.
 let selectedBeatId = null;
+let selectedBeatPlaylistId = localStorage.getItem('audiotaller.beats.playlist') || 'default';
+let beatsPlaylists = [];
 let beatsRequest = 0;
-async function loadBeats() {
+let beatPlaylistDialogMode = 'create';
+async function loadBeats(loadPlaylists = true) {
     const request = ++beatsRequest;
     try {
-        const result = await api('/api/beats');
+        if (loadPlaylists) {
+            const result = await api('/api/beats/playlists');
+            beatsPlaylists = result.listas || [];
+            const saved = localStorage.getItem('audiotaller.beats.playlist');
+            if (!beatsPlaylists.some(item => item.id === selectedBeatPlaylistId)) {
+                selectedBeatPlaylistId = beatsPlaylists.some(item => item.id === saved) ? saved : (beatsPlaylists[0]?.id || null);
+            }
+            $('beatsPlaylistSelect').innerHTML = beatsPlaylists.map(item =>
+                `<option value="${esc(item.id)}">${esc(item.nombre)} (${item.cantidad})</option>`).join('');
+            $('beatsPlaylistSelect').value = selectedBeatPlaylistId || '';
+            $('renameBeatPlaylist').disabled = !selectedBeatPlaylistId;
+            $('deleteBeatPlaylist').disabled = !selectedBeatPlaylistId;
+            $('addBeats').disabled = !selectedBeatPlaylistId;
+            if (selectedBeatPlaylistId) localStorage.setItem('audiotaller.beats.playlist', selectedBeatPlaylistId);
+            else localStorage.removeItem('audiotaller.beats.playlist');
+        }
+        if (!selectedBeatPlaylistId) {
+            selectedBeatId = null;
+            $('beatPlayer').pause(); $('beatPlayer').removeAttribute('src'); $('beatPlayer').load();
+            $('beatNow').textContent = 'Creá o seleccioná una lista para escuchar un audio.';
+            $('openBeatFolder').disabled = true;
+            $('beatsCount').textContent = '0 audios';
+            $('beatsListTitle').textContent = 'Sin listas';
+            $('beatsStatus').textContent = 'Todavía no hay listas. Usá «Nueva lista» para crear la primera.';
+            $('beatsList').innerHTML = '<div class="beats-empty">No hay listas de Beats. Podés crear una nueva cuando quieras.</div>';
+            return;
+        }
+        const result = await api('/api/beats?playlist_id=' + encodeURIComponent(selectedBeatPlaylistId));
         if (request !== beatsRequest || trail.at(-1) !== 'beats') return;
         renderBeats(result);
     } catch (error) {
-        if (request === beatsRequest) { $('beatsStatus').textContent = error.message; }
+        if (request === beatsRequest) $('beatsStatus').textContent = error.message;
     }
 }
 function renderBeats(result) {
     const beats = result.audios || [];
+    const playlist = beatsPlaylists.find(item => item.id === selectedBeatPlaylistId);
     $('beatsCount').textContent = beats.length + (beats.length === 1 ? ' audio' : ' audios');
-    $('beatsStatus').textContent = beats.length ? 'Tu lista está guardada automáticamente.' : 'Todavía no agregaste audios. Usá “Agregar audios” para elegir archivos de tu PC.';
+    $('beatsListTitle').textContent = playlist ? playlist.nombre : 'Mi lista de audios';
+    $('beatsStatus').textContent = beats.length ? `Lista «${playlist?.nombre || 'Beats'}» guardada automáticamente.` : 'Esta lista está vacía. Usá “Agregar audios” para elegir archivos de tu PC.';
     if (selectedBeatId && !beats.some(item => item.id === selectedBeatId)) {
         selectedBeatId = null;
         $('beatPlayer').pause(); $('beatPlayer').removeAttribute('src'); $('beatPlayer').load();
         $('beatNow').textContent = 'Seleccioná un audio de la lista para escucharlo.';
         $('openBeatFolder').disabled = true;
     }
-    $('beatsList').innerHTML = beats.length ? beats.map((item, index) => `
+    $('beatsList').innerHTML = beats.length ? beats.map(item => `
       <div class="item beat-row" draggable="true" data-beat-row="${esc(item.id)}">
         <span class="beat-grip" title="Arrastrar para cambiar el orden" aria-hidden="true">⠿</span>
         <button class="beat-select" data-beat-select="${esc(item.id)}" aria-pressed="${item.id === selectedBeatId}">♫ <span><b>${esc(item.nombre)}</b><small class="muted" style="display:block">${esc(item.formato)} · ${item.disponible ? 'Disponible' : '<span class="beat-missing">No se encuentra en esta ubicación</span>'}</small></span></button>
         <div class="beat-actions"><button class="alt" data-beat-folder="${esc(item.id)}" title="Abrir carpeta" ${item.disponible ? '' : 'disabled'}>📁</button><button class="alt" data-beat-remove="${esc(item.id)}" title="Quitar de la lista">✕</button></div>
       </div>`).join('') : '<div class="beats-empty">Tu lista está vacía.</div>';
-    for (const button of $('beatsList').querySelectorAll('[data-beat-select]')) {
-        button.addEventListener('click', () => selectBeat(button.dataset.beatSelect, beats));
-    }
-    for (const button of $('beatsList').querySelectorAll('[data-beat-folder]')) {
-        button.addEventListener('click', () => openBeatFolder(button.dataset.beatFolder));
-    }
-    for (const button of $('beatsList').querySelectorAll('[data-beat-remove]')) {
-        button.addEventListener('click', () => removeBeat(button.dataset.beatRemove));
-    }
+    for (const button of $('beatsList').querySelectorAll('[data-beat-select]')) button.addEventListener('click', () => selectBeat(button.dataset.beatSelect, beats));
+    for (const button of $('beatsList').querySelectorAll('[data-beat-folder]')) button.addEventListener('click', () => openBeatFolder(button.dataset.beatFolder));
+    for (const button of $('beatsList').querySelectorAll('[data-beat-remove]')) button.addEventListener('click', () => removeBeat(button.dataset.beatRemove));
     bindBeatReordering();
     if (selectedBeatId) {
         const selected = beats.find(item => item.id === selectedBeatId);
@@ -495,63 +521,49 @@ function bindBeatReordering() {
         });
         row.addEventListener('dragover', event => {
             if (!draggedBeatId || draggedBeatId === row.dataset.beatRow) return;
-            event.preventDefault();
-            event.dataTransfer.dropEffect = 'move';
-            row.classList.add('beat-drop-target');
+            event.preventDefault(); event.dataTransfer.dropEffect = 'move'; row.classList.add('beat-drop-target');
         });
         row.addEventListener('dragleave', () => row.classList.remove('beat-drop-target'));
         row.addEventListener('drop', async event => {
-            event.preventDefault();
-            row.classList.remove('beat-drop-target');
-            const sourceId = draggedBeatId || event.dataTransfer.getData('text/plain');
-            draggedBeatId = null;
+            event.preventDefault(); row.classList.remove('beat-drop-target');
+            const sourceId = draggedBeatId || event.dataTransfer.getData('text/plain'); draggedBeatId = null;
             if (sourceId && sourceId !== row.dataset.beatRow) await moveBeatBefore(sourceId, row.dataset.beatRow);
         });
-        row.addEventListener('dragend', () => {
-            draggedBeatId = null;
-            rows.forEach(item => item.classList.remove('beat-dragging', 'beat-drop-target'));
-        });
+        row.addEventListener('dragend', () => { draggedBeatId = null; rows.forEach(item => item.classList.remove('beat-dragging', 'beat-drop-target')); });
     });
 }
 async function persistBeatOrder(ids) {
     try {
-        await api('/api/beats/orden', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids})});
-        await loadBeats();
-    } catch (error) { report(error); await loadBeats(); }
+        await api('/api/beats/orden', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids,playlist_id:selectedBeatPlaylistId})});
+        await loadBeats(false);
+    } catch (error) { report(error); await loadBeats(false); }
 }
 async function moveBeatBefore(sourceId, targetId) {
     try {
-        const result = await api('/api/beats');
+        const result = await api('/api/beats?playlist_id=' + encodeURIComponent(selectedBeatPlaylistId));
         const ids = (result.audios || []).map(item => item.id);
-        const from = ids.indexOf(sourceId);
-        const to = ids.indexOf(targetId);
+        const from = ids.indexOf(sourceId), to = ids.indexOf(targetId);
         if (from < 0 || to < 0 || from === to) return;
-        ids.splice(to, 0, ids.splice(from, 1)[0]);
-        await persistBeatOrder(ids);
+        ids.splice(to, 0, ids.splice(from, 1)[0]); await persistBeatOrder(ids);
     } catch (error) { report(error); }
 }
-
 async function addBeats() {
     try {
-        if (!window.pywebview?.api?.choose_audio_files) {
-            throw Error('El selector de archivos local está disponible al iniciar AudioTaller desde Iniciar_AudioTaller.vbs.');
-        }
+        if (!selectedBeatPlaylistId) throw Error('Primero creá o seleccioná una lista de Beats.');
+        if (!window.pywebview?.api?.choose_audio_files) throw Error('El selector de archivos local está disponible al iniciar AudioTaller desde Iniciar_AudioTaller.vbs.');
         const paths = await window.pywebview.api.choose_audio_files();
         if (!paths || !paths.length) return;
-        const result = await api('/api/beats', body({paths}));
+        const result = await api('/api/beats', body({paths,playlist_id:selectedBeatPlaylistId}));
         $('beatsStatus').textContent = result.agregados + ' audio(s) agregado(s).' + (result.omitidos ? ' ' + result.omitidos + ' omitido(s).' : '');
-        await loadBeats();
+        await loadBeats(true);
     } catch (error) { report(error); }
 }
 function selectBeat(id, beats) {
     const beat = beats.find(item => item.id === id);
     if (!beat || !beat.disponible) { report(Error('No se encuentra el archivo en su ubicación original.')); return; }
-    selectedBeatId = id;
-    $('beatNow').textContent = beat.nombre;
-    $('beatPlayer').src = '/api/beats/' + encodeURIComponent(id) + '/audio';
-    $('beatPlayer').load();
-    $('openBeatFolder').disabled = false;
-    renderBeats({audios: beats});
+    selectedBeatId = id; $('beatNow').textContent = beat.nombre;
+    $('beatPlayer').src = '/api/beats/' + encodeURIComponent(id) + '/audio'; $('beatPlayer').load();
+    $('openBeatFolder').disabled = false; renderBeats({audios: beats});
 }
 async function openBeatFolder(id = selectedBeatId) {
     if (!id) return;
@@ -563,8 +575,60 @@ async function openBeatFolder(id = selectedBeatId) {
 }
 async function removeBeat(id) {
     if (!confirm('¿Quitar este audio de la lista? El archivo original no se borrará.')) return;
-    try { await api('/api/beats/' + encodeURIComponent(id), {method:'DELETE'}); await loadBeats(); }
+    try { await api('/api/beats/' + encodeURIComponent(id), {method:'DELETE'}); await loadBeats(true); }
     catch (error) { report(error); }
 }
+async function deleteBeatPlaylist() {
+    const playlist = beatsPlaylists.find(item => item.id === selectedBeatPlaylistId);
+    if (!playlist) return;
+    const count = Number(playlist.cantidad) || 0;
+    const detail = count === 1 ? '1 audio' : `${count} audios`;
+    if (!confirm(`¿Eliminar la lista «${playlist.nombre}»? Contiene ${detail}. Se quitarán de AudioTaller, pero los archivos originales permanecerán en tu PC.`)) return;
+    try {
+        await api('/api/beats/playlists/' + encodeURIComponent(playlist.id), {method:'DELETE'});
+        selectedBeatId = null;
+        $('beatPlayer').pause(); $('beatPlayer').removeAttribute('src'); $('beatPlayer').load();
+        $('beatNow').textContent = 'Seleccioná un audio de la lista para escucharlo.';
+        $('openBeatFolder').disabled = true;
+        selectedBeatPlaylistId = null;
+        localStorage.removeItem('audiotaller.beats.playlist');
+        await loadBeats(true);
+    } catch (error) { report(error); }
+}
+function openBeatPlaylistDialog(mode) {
+    beatPlaylistDialogMode = mode;
+    const current = beatsPlaylists.find(item => item.id === selectedBeatPlaylistId);
+    $('beatPlaylistDialogTitle').textContent = mode === 'create' ? 'Crear nueva lista' : 'Cambiar nombre de la lista';
+    $('beatPlaylistName').value = mode === 'rename' ? (current?.nombre || '') : '';
+    $('beatPlaylistDialog').showModal(); $('beatPlaylistName').focus();
+}
+$('beatPlaylistForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const name = $('beatPlaylistName').value.trim();
+    if (!name) return;
+    const submit = $('beatPlaylistForm').querySelector('[type=submit]'); submit.disabled = true;
+    try {
+        if (beatPlaylistDialogMode === 'create') {
+            const created = await api('/api/beats/playlists', body({nombre:name}));
+            selectedBeatPlaylistId = created.id; localStorage.setItem('audiotaller.beats.playlist', created.id);
+        } else {
+            await api('/api/beats/playlists/' + encodeURIComponent(selectedBeatPlaylistId), {method:'PATCH',body:JSON.stringify({nombre:name})});
+        }
+        $('beatPlaylistDialog').close(); await loadBeats(true);
+    } catch (error) { report(error); }
+    finally { submit.disabled = false; }
+});
+$('cancelBeatPlaylist').addEventListener('click', () => $('beatPlaylistDialog').close());
+$('newBeatPlaylist').addEventListener('click', () => openBeatPlaylistDialog('create'));
+$('renameBeatPlaylist').addEventListener('click', () => openBeatPlaylistDialog('rename'));
+$('deleteBeatPlaylist').addEventListener('click', deleteBeatPlaylist);
+$('beatsPlaylistSelect').addEventListener('change', async event => {
+    selectedBeatPlaylistId = event.target.value || null;
+    if (selectedBeatPlaylistId) localStorage.setItem('audiotaller.beats.playlist', selectedBeatPlaylistId);
+    else localStorage.removeItem('audiotaller.beats.playlist');
+    selectedBeatId = null; $('beatPlayer').pause(); $('beatPlayer').removeAttribute('src'); $('beatPlayer').load();
+    $('beatNow').textContent = 'Seleccioná un audio de la lista para escucharlo.'; $('openBeatFolder').disabled = true;
+    await loadBeats(false);
+});
 $('addBeats').addEventListener('click', addBeats);
 $('openBeatFolder').addEventListener('click', () => openBeatFolder());
