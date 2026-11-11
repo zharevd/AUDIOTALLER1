@@ -29,6 +29,7 @@ function display() {
     if (page === 'profile' && artist) renderProfile();
     if (page === 'beats') loadBeats();
     if (page === 'scores') loadScores();
+    if (page === 'lyrics') loadLyrics();
     if (visible === 'manager') {
         const projects = page === 'projectManager';
         $('managerTitle').textContent = projects ? 'Gestión de proyectos por artistas' : 'Gestión de artistas';
@@ -784,3 +785,62 @@ $('renameScoreCollection').addEventListener('click',()=>openScoreCollectionDialo
 $('deleteScoreCollection').addEventListener('click',deleteScoreCollection);
 $('openScoreFolder').addEventListener('click',()=>openScoreFolder());
 $('cancelScoreCollection').addEventListener('click',()=>$('scoreCollectionDialog').close());
+// Letras: organización de archivos TXT y DOCX en colecciones.
+let lyricCollections=[], selectedLyricCollectionId=localStorage.getItem('audiotaller.lyrics.collection')||null;
+let selectedLyricId=null, lyricDialogMode='create', draggedLyricId=null, lyricsRequest=0;
+async function loadLyrics(preserve=false) {
+    const req=++lyricsRequest;
+    try {
+        const data=await api('/api/lyrics/collections'); lyricCollections=data.colecciones||[];
+        if(!preserve||!lyricCollections.some(x=>x.id===selectedLyricCollectionId)) {
+            const saved=localStorage.getItem('audiotaller.lyrics.collection');
+            selectedLyricCollectionId=lyricCollections.some(x=>x.id===saved)?saved:(lyricCollections[0]?.id||null);
+        }
+        $('lyricsCollectionSelect').innerHTML=lyricCollections.map(x=>`<option value="${esc(x.id)}">${esc(x.nombre)}</option>`).join('');
+        $('lyricsCollectionSelect').value=selectedLyricCollectionId||'';
+        $('lyricsCollectionSelect').disabled=!lyricCollections.length;
+        $('renameLyricCollection').disabled=!selectedLyricCollectionId;
+        $('deleteLyricCollection').disabled=!selectedLyricCollectionId;
+        $('addLyrics').disabled=!selectedLyricCollectionId;
+        if(selectedLyricCollectionId)localStorage.setItem('audiotaller.lyrics.collection',selectedLyricCollectionId);else localStorage.removeItem('audiotaller.lyrics.collection');
+        if(!selectedLyricCollectionId) {
+            $('lyricsCount').textContent='0 letras'; $('lyricsListTitle').textContent='Sin colecciones';
+            $('lyricsStatus').textContent='Todavía no hay colecciones. Creá una para comenzar.';
+            $('lyricsList').innerHTML='<div class="muted">No hay colecciones de letras.</div>'; clearLyricViewer(); return;
+        }
+        const result=await api('/api/lyrics?collection_id='+encodeURIComponent(selectedLyricCollectionId));
+        if(req!==lyricsRequest||trail.at(-1)!=='lyrics')return; renderLyrics(result);
+    } catch(error) { if(req===lyricsRequest)$('lyricsStatus').textContent=error.message; }
+}
+function clearLyricViewer(){selectedLyricId=null;$('lyricNow').textContent='Seleccioná una letra de la colección para verla.';$('openLyricFolder').disabled=true;$('lyricViewer').textContent='♫\nEl contenido de la letra aparecerá acá.';}
+function renderLyrics(data){
+    const items=data.letras||[], collection=lyricCollections.find(x=>x.id===selectedLyricCollectionId);
+    $('lyricsCount').textContent=items.length+(items.length===1?' letra':' letras'); $('lyricsListTitle').textContent=collection?.nombre||'Mis letras';
+    $('lyricsStatus').textContent=items.length?`Colección «${collection?.nombre||'Letras'}» guardada automáticamente.`:'Esta colección está vacía. Usá «Agregar letras» para elegir archivos de tu PC.';
+    if(selectedLyricId&&!items.some(x=>x.id===selectedLyricId))clearLyricViewer();
+    $('lyricsList').innerHTML=items.length?items.map(item=>`<div class="item lyric-row" draggable="true" data-lyric-row="${esc(item.id)}"><span class="lyric-grip" title="Arrastrar para cambiar el orden">⠿</span><button class="lyric-select" data-lyric-select="${esc(item.id)}" aria-pressed="${item.id===selectedLyricId}"><span>▤ <b>${esc(item.nombre)}</b><small class="muted">${esc(item.formato)} · ${item.disponible?'Disponible':'No se encuentra en esta ubicación'}</small></span></button><div class="lyric-actions"><button class="alt" data-lyric-folder="${esc(item.id)}" title="Abrir carpeta" ${item.disponible?'':'disabled'}>📁</button><button class="alt" data-lyric-remove="${esc(item.id)}" title="Quitar de la colección">✕</button></div></div>`).join(''):'<div class="muted">Tu colección está vacía.</div>';
+    for(const b of $('lyricsList').querySelectorAll('[data-lyric-select]'))b.addEventListener('click',()=>selectLyric(b.dataset.lyricSelect,items));
+    for(const b of $('lyricsList').querySelectorAll('[data-lyric-folder]'))b.addEventListener('click',()=>openLyricFolder(b.dataset.lyricFolder));
+    for(const b of $('lyricsList').querySelectorAll('[data-lyric-remove]'))b.addEventListener('click',()=>removeLyric(b.dataset.lyricRemove));
+    bindLyricReordering();
+}
+async function selectLyric(id,items){
+    const item=items.find(x=>x.id===id); if(!item||!item.disponible){report(Error('No se encuentra el archivo en su ubicación original.'));return;}
+    selectedLyricId=id;$('lyricNow').textContent=item.nombre;$('openLyricFolder').disabled=false;$('lyricViewer').textContent='Cargando letra…';renderLyrics({letras:items});
+    try{const response=await fetch('/api/lyrics/'+encodeURIComponent(id)+'/file');if(!response.ok){const error=await response.json().catch(()=>({}));throw Error(error.error||'No se pudo abrir la letra.');}$('lyricViewer').textContent=await response.text();}
+    catch(error){$('lyricViewer').textContent=error.message;report(error);}
+}
+async function addLyrics(){
+    try{if(!selectedLyricCollectionId)throw Error('Primero creá o seleccioná una colección.');if(!window.pywebview?.api?.choose_lyric_files)throw Error('El selector local está disponible al iniciar AudioTaller desde Iniciar_AudioTaller.vbs.');const paths=await window.pywebview.api.choose_lyric_files();if(!paths?.length)return;const result=await api('/api/lyrics',body({paths,collection_id:selectedLyricCollectionId}));$('lyricsStatus').textContent=result.agregados+' letra(s) agregada(s).'+(result.omitidos?' '+result.omitidos+' omitida(s).':'');await loadLyrics(true);}
+    catch(error){report(error);}
+}
+async function openLyricFolder(id=selectedLyricId){if(!id)return;try{if(!window.pywebview?.api?.open_lyric_location)throw Error('La apertura de carpetas requiere la aplicación de escritorio.');if(!await window.pywebview.api.open_lyric_location(id))throw Error('No se pudo abrir la carpeta de la letra.');}catch(error){report(error);}}
+async function removeLyric(id){if(!confirm('¿Quitar esta letra de la colección? El archivo original no se borrará.'))return;try{await api('/api/lyrics/'+encodeURIComponent(id),{method:'DELETE'});await loadLyrics(true);}catch(error){report(error);}}
+async function deleteLyricCollection(){const collection=lyricCollections.find(x=>x.id===selectedLyricCollectionId);if(!collection)return;const count=Number(collection.cantidad)||0;if(!confirm(`¿Eliminar la colección «${collection.nombre}»? Se quitarán ${count} referencia(s) de AudioTaller, pero los archivos originales permanecerán en tu PC.`))return;try{await api('/api/lyrics/collections/'+encodeURIComponent(collection.id),{method:'DELETE'});selectedLyricCollectionId=null;localStorage.removeItem('audiotaller.lyrics.collection');clearLyricViewer();await loadLyrics(true);}catch(error){report(error);}}
+function openLyricCollectionDialog(mode){lyricDialogMode=mode;const current=lyricCollections.find(x=>x.id===selectedLyricCollectionId);$('lyricCollectionDialogTitle').textContent=mode==='create'?'Crear nueva colección':'Cambiar nombre de la colección';$('lyricCollectionName').value=mode==='rename'?(current?.nombre||''):'';$('lyricCollectionDialog').showModal();$('lyricCollectionName').focus();}
+$('lyricCollectionForm').addEventListener('submit',async event=>{event.preventDefault();const name=$('lyricCollectionName').value.trim();if(!name)return;const submit=$('lyricCollectionForm').querySelector('[type=submit]');submit.disabled=true;try{if(lyricDialogMode==='create'){const created=await api('/api/lyrics/collections',body({nombre:name}));selectedLyricCollectionId=created.id;localStorage.setItem('audiotaller.lyrics.collection',created.id);}else await api('/api/lyrics/collections/'+encodeURIComponent(selectedLyricCollectionId),{method:'PATCH',body:JSON.stringify({nombre:name})});$('lyricCollectionDialog').close();await loadLyrics(true);}catch(error){report(error);}finally{submit.disabled=false;}});
+function bindLyricReordering(){const rows=$('lyricsList').querySelectorAll('[data-lyric-row]');rows.forEach(row=>{row.addEventListener('dragstart',event=>{draggedLyricId=row.dataset.lyricRow;row.classList.add('beat-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',draggedLyricId);});row.addEventListener('dragover',event=>{if(!draggedLyricId||draggedLyricId===row.dataset.lyricRow)return;event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('beat-drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('beat-drop-target'));row.addEventListener('drop',async event=>{event.preventDefault();row.classList.remove('beat-drop-target');const source=draggedLyricId||event.dataTransfer.getData('text/plain');draggedLyricId=null;if(source&&source!==row.dataset.lyricRow)await moveLyricBefore(source,row.dataset.lyricRow);});row.addEventListener('dragend',()=>{draggedLyricId=null;rows.forEach(x=>x.classList.remove('beat-dragging','beat-drop-target'));});});}
+async function moveLyricBefore(sourceId,targetId){try{const data=await api('/api/lyrics?collection_id='+encodeURIComponent(selectedLyricCollectionId));const ids=(data.letras||[]).map(x=>x.id),from=ids.indexOf(sourceId),to=ids.indexOf(targetId);if(from<0||to<0||from===to)return;ids.splice(to,0,ids.splice(from,1)[0]);await api('/api/lyrics/orden',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,collection_id:selectedLyricCollectionId})});await loadLyrics(false);}catch(error){report(error);await loadLyrics(false);}}
+$('lyricsCollectionSelect').addEventListener('change',async event=>{selectedLyricCollectionId=event.target.value||null;if(selectedLyricCollectionId)localStorage.setItem('audiotaller.lyrics.collection',selectedLyricCollectionId);else localStorage.removeItem('audiotaller.lyrics.collection');clearLyricViewer();await loadLyrics(false);});
+$('addLyrics').addEventListener('click',addLyrics);$('newLyricCollection').addEventListener('click',()=>openLyricCollectionDialog('create'));$('renameLyricCollection').addEventListener('click',()=>openLyricCollectionDialog('rename'));$('deleteLyricCollection').addEventListener('click',deleteLyricCollection);$('openLyricFolder').addEventListener('click',()=>openLyricFolder());$('cancelLyricCollection').addEventListener('click',()=>$('lyricCollectionDialog').close());
+

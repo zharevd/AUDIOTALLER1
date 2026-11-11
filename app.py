@@ -6,7 +6,9 @@ from production import register_production
 from flask import Flask, jsonify, request, send_file
 from itsdangerous import BadSignature, URLSafeSerializer
 from pathlib import Path
-import os, re, sqlite3, uuid
+import os, re, sqlite3, uuid, zipfile
+from xml.etree import ElementTree as ET
+from flask import Response
 
 app = Flask(__name__)
 ROOT = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'AudioTaller'
@@ -48,6 +50,8 @@ def db_open():
         collection_id TEXT NOT NULL REFERENCES score_collections(id),
         UNIQUE(collection_id,ruta)
     );
+    CREATE TABLE IF NOT EXISTS lyric_collections(id TEXT PRIMARY KEY,nombre TEXT NOT NULL,posicion INTEGER NOT NULL DEFAULT 0,creado TEXT DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS lyrics(id TEXT PRIMARY KEY,nombre TEXT NOT NULL,ruta TEXT NOT NULL,creado TEXT DEFAULT CURRENT_TIMESTAMP,posicion INTEGER NOT NULL DEFAULT 0,collection_id TEXT NOT NULL REFERENCES lyric_collections(id),UNIQUE(collection_id,ruta));
     ''')
     # Migración compatible: la lista de Beats existente pasa a ser "Mi lista".
     db.execute("INSERT OR IGNORE INTO playlists(id,nombre,posicion) VALUES('default','Mi lista',0)")
@@ -575,6 +579,117 @@ def scores_file(sid):
         if mime and path.is_file(): return send_file(path,mimetype=mime,conditional=True,max_age=0)
     except (OSError,RuntimeError): pass
     return jsonify(error='El archivo ya no está disponible en su ubicación original.'),404
+
+
+
+# Letras: colecciones y referencias a archivos originales TXT/DOCX.
+LYRIC_TYPES = {'.txt', '.docx'}
+
+@app.get('/api/lyrics/collections')
+def lyrics_collections():
+    with db_open() as db:
+        rows = db.execute("SELECT c.id,c.nombre,c.posicion,c.creado,COUNT(l.id) AS cantidad FROM lyric_collections c LEFT JOIN lyrics l ON l.collection_id=c.id GROUP BY c.id ORDER BY c.posicion,c.creado,c.nombre COLLATE NOCASE").fetchall()
+    return jsonify(colecciones=[dict(row) for row in rows])
+
+@app.post('/api/lyrics/collections')
+def lyrics_collection_create():
+    data=request.get_json() or {}; name=data.get('nombre','').strip() if isinstance(data.get('nombre',''),str) else ''
+    if not name or len(name)>80: return jsonify(error='Ingresá un nombre de colección de entre 1 y 80 caracteres.'),400
+    cid=uuid.uuid4().hex
+    with db_open() as db:
+        pos=db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM lyric_collections').fetchone()[0]
+        db.execute('INSERT INTO lyric_collections(id,nombre,posicion) VALUES(?,?,?)',(cid,name,pos))
+    return jsonify(id=cid,nombre=name),201
+
+@app.patch('/api/lyrics/collections/<cid>')
+def lyrics_collection_rename(cid):
+    data=request.get_json() or {}; name=data.get('nombre','').strip() if isinstance(data.get('nombre',''),str) else ''
+    if not name or len(name)>80: return jsonify(error='Ingresá un nombre de colección de entre 1 y 80 caracteres.'),400
+    with db_open() as db: cur=db.execute('UPDATE lyric_collections SET nombre=? WHERE id=?',(name,cid))
+    if not cur.rowcount: return jsonify(error='No se encontró la colección.'),404
+    return jsonify(ok=True,nombre=name)
+
+@app.delete('/api/lyrics/collections/<cid>')
+def lyrics_collection_delete(cid):
+    with db_open() as db:
+        row=db.execute('SELECT id,nombre FROM lyric_collections WHERE id=?',(cid,)).fetchone()
+        if not row: return jsonify(error='No se encontró la colección.'),404
+        count=db.execute('SELECT COUNT(*) FROM lyrics WHERE collection_id=?',(cid,)).fetchone()[0]
+        db.execute('DELETE FROM lyrics WHERE collection_id=?',(cid,)); db.execute('DELETE FROM lyric_collections WHERE id=?',(cid,))
+    return jsonify(ok=True,eliminados=count,nombre=row['nombre'])
+
+@app.get('/api/lyrics')
+def lyrics_list():
+    cid=request.args.get('collection_id','')
+    with db_open() as db:
+        if not db.execute('SELECT 1 FROM lyric_collections WHERE id=?',(cid,)).fetchone(): return jsonify(error='No se encontró la colección seleccionada.'),404
+        rows=db.execute('SELECT id,nombre,ruta,creado FROM lyrics WHERE collection_id=? ORDER BY posicion,id',(cid,)).fetchall()
+    items=[]
+    for row in rows:
+        path=Path(row['ruta']); items.append(dict(id=row['id'],nombre=row['nombre'],formato=path.suffix[1:].upper(),disponible=path.is_file(),creado=row['creado']))
+    return jsonify(letras=items,collection_id=cid)
+
+@app.post('/api/lyrics')
+def lyrics_add():
+    data=request.get_json() or {}; paths=data.get('paths',[]); cid=data.get('collection_id','')
+    if not isinstance(paths,list) or not paths or len(paths)>200: return jsonify(error='Seleccioná entre 1 y 200 archivos de letras.'),400
+    added=skipped=0
+    with db_open() as db:
+        if not db.execute('SELECT 1 FROM lyric_collections WHERE id=?',(cid,)).fetchone(): return jsonify(error='No se encontró la colección seleccionada.'),404
+        for raw in paths:
+            if not isinstance(raw,str) or len(raw)>32767: skipped+=1; continue
+            try:
+                path=Path(raw).resolve(strict=True)
+                if not path.is_file() or path.suffix.lower() not in LYRIC_TYPES: skipped+=1; continue
+                pos=db.execute('SELECT COALESCE(MAX(posicion),-1)+1 FROM lyrics WHERE collection_id=?',(cid,)).fetchone()[0]
+                cur=db.execute('INSERT OR IGNORE INTO lyrics(id,nombre,ruta,posicion,collection_id) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,path.stem,str(path),pos,cid))
+                added+=cur.rowcount; skipped+=int(not cur.rowcount)
+            except (OSError,RuntimeError,ValueError): skipped+=1
+    return jsonify(agregados=added,omitidos=skipped),201
+
+@app.put('/api/lyrics/orden')
+def lyrics_reorder():
+    data=request.get_json() or {}; ids=data.get('ids'); cid=data.get('collection_id','')
+    if not isinstance(ids,list) or len(ids)>10000 or any(not isinstance(x,str) for x in ids) or len(ids)!=len(set(ids)): return jsonify(error='La lista de posiciones no es válida.'),400
+    with db_open() as db:
+        current={r['id'] for r in db.execute('SELECT id FROM lyrics WHERE collection_id=?',(cid,))}
+        if set(ids)!=current: return jsonify(error='La lista cambió. Actualizá Letras e intentá nuevamente.'),409
+        db.executemany('UPDATE lyrics SET posicion=? WHERE id=? AND collection_id=?',[(i,lid,cid) for i,lid in enumerate(ids)])
+    return jsonify(ok=True)
+
+@app.delete('/api/lyrics/<lid>')
+def lyrics_remove(lid):
+    with db_open() as db: cur=db.execute('DELETE FROM lyrics WHERE id=?',(lid,))
+    if not cur.rowcount: return jsonify(error='La letra no está en la colección.'),404
+    return jsonify(ok=True)
+
+def read_docx_text(path):
+    with zipfile.ZipFile(path) as archive: xml=archive.read('word/document.xml')
+    root=ET.fromstring(xml); ns={'w':'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}; paragraphs=[]
+    for paragraph in root.findall('.//w:p',ns):
+        parts=[]
+        for node in paragraph.iter():
+            if node.tag.endswith('}t') and node.text: parts.append(node.text)
+            elif node.tag.endswith('}tab'): parts.append('\t')
+        paragraphs.append(''.join(parts))
+    return '\n'.join(paragraphs)
+
+@app.get('/api/lyrics/<lid>/file')
+def lyrics_file(lid):
+    with db_open() as db: row=db.execute('SELECT ruta FROM lyrics WHERE id=?',(lid,)).fetchone()
+    if not row: return jsonify(error='La letra ya no está en la colección.'),404
+    try:
+        path=Path(row['ruta']).resolve(strict=True)
+        if not path.is_file() or path.suffix.lower() not in LYRIC_TYPES: raise OSError('Tipo no permitido')
+        if path.suffix.lower()=='.txt':
+            content=None
+            for encoding in ('utf-8-sig','cp1252','latin-1'):
+                try: content=path.read_text(encoding=encoding); break
+                except UnicodeDecodeError: continue
+            return Response(content or '',mimetype='text/plain; charset=utf-8')
+        return Response(read_docx_text(path),mimetype='text/plain; charset=utf-8')
+    except (OSError,RuntimeError,KeyError,zipfile.BadZipFile,ET.ParseError):
+        return jsonify(error='No se pudo leer el archivo. Comprobá que siga disponible y que sea un TXT o DOCX válido.'),404
 
 
 @app.get('/api/arreglos/audio/<token>')

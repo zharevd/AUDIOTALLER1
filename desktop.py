@@ -50,6 +50,26 @@ def main():
             )
             return list(result) if result else []
 
+        def choose_lyric_files(self):
+            # TXT y DOCX; se conservan en su ubicación original.
+            result = webview.windows[0].create_file_dialog(
+                webview.FileDialog.OPEN, allow_multiple=True,
+                file_types=('Letras (*.txt;*.docx)', 'Todos los archivos (*.*)')
+            )
+            return list(result) if result else []
+
+        def open_lyric_location(self, lyric_id):
+            from app import db_open
+            with db_open() as db:
+                row = db.execute('SELECT ruta FROM lyrics WHERE id=?', (str(lyric_id),)).fetchone()
+            if not row: return False
+            try:
+                archivo = Path(row['ruta']).resolve(strict=True)
+                if not archivo.is_file(): return False
+                os.startfile(str(archivo.parent))
+                return True
+            except (OSError, RuntimeError): return False
+
         def open_score_location(self, score_id):
             from app import db_open
             with db_open() as db:
